@@ -146,7 +146,8 @@ class FeedConfigRequest(BaseModel):
 # ─────────────────────────────────────────────────────
 BASE_DIR = Path(__file__).resolve().parent
 STATIC_DIR = BASE_DIR / "static"
-DATA_DIR = BASE_DIR / "data"
+DEFAULT_DATA_DIR = "/tmp/riskintel" if os.getenv("VERCEL") else str(BASE_DIR / "data")
+DATA_DIR = Path(os.getenv("RISKINTEL_DATA_DIR", DEFAULT_DATA_DIR))
 logger = logging.getLogger("riskintel")
 
 
@@ -210,10 +211,6 @@ app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
 AUTH_ENFORCED = os.getenv("RISKINTEL_ENFORCE_AUTH", "true").lower() == "true"
 DEFAULT_API_KEY = os.getenv("RISKINTEL_DEFAULT_API_KEY", "").strip()
-LIVE_FEEDS_DEFAULT = (
-    os.getenv("RISKINTEL_USE_LIVE_FEEDS", "true").lower() == "true"
-    and threat_intel_engine.live_feeds_available
-)
 _feed_status_cache: Dict[str, Any] = {"feeds": [], "summary": {"configured": 0, "reachable": 0, "auth_valid": 0, "total": 0}}
 
 
@@ -239,6 +236,13 @@ def _reload_feed_keys() -> None:
     threat_intel_engine.vt_key = _feed_env("VIRUSTOTAL_API_KEY", "RISKINTEL_VT_API_KEY")
     threat_intel_engine.shodan_key = _feed_env("SHODAN_API_KEY", "RISKINTEL_SHODAN_API_KEY")
     threat_intel_engine.urlscan_key = _feed_env("URLSCAN_API_KEY", "RISKINTEL_URLSCAN_API_KEY")
+
+
+def _live_feeds_default() -> bool:
+    return (
+        os.getenv("RISKINTEL_USE_LIVE_FEEDS", "true").lower() == "true"
+        and threat_intel_engine.live_feeds_available
+    )
 
 
 def _build_feed_configs() -> Dict[str, Dict[str, Any]]:
@@ -439,6 +443,15 @@ RiskEngine._intent_profile = _patched_intent_profile
 _reload_feed_keys()
 
 
+@app.exception_handler(Exception)
+async def unhandled_exception_handler(request: Request, exc: Exception) -> JSONResponse:
+    logger.exception("Unhandled exception for %s %s", request.method, request.url.path, exc_info=exc)
+    return JSONResponse(
+        status_code=500,
+        content={"detail": "Internal server error", "path": request.url.path},
+    )
+
+
 def _website_verdict_from_score(score: int) -> str:
     if score >= 70:
         return "DANGER"
@@ -607,6 +620,11 @@ def get_current_user(x_api_key: Optional[str] = Header(default=None)) -> UserCon
     user = auth_manager.identify(provided_key or DEFAULT_API_KEY)
     if not user.authenticated and DEFAULT_API_KEY and provided_key and provided_key != DEFAULT_API_KEY:
         user = auth_manager.identify(DEFAULT_API_KEY)
+    if AUTH_ENFORCED and auth_manager.key_count == 0:
+        raise HTTPException(
+            status_code=503,
+            detail="Authentication is enabled but RISKINTEL_API_KEYS is not configured",
+        )
     if AUTH_ENFORCED and not user.authenticated:
         raise HTTPException(status_code=401, detail="Valid X-API-Key is required")
     return user
@@ -650,7 +668,8 @@ async def health() -> dict:
         "configured_api_keys": auth_manager.key_count,
         "default_api_key_configured": bool(DEFAULT_API_KEY),
         "live_feeds_available": threat_intel_engine.live_feeds_available,
-        "live_feeds_default": LIVE_FEEDS_DEFAULT,
+        "live_feeds_default": _live_feeds_default(),
+        "data_dir": str(DATA_DIR),
         "live_feed_status": threat_intel_engine.live_feed_status,
         "engine_cache_sizes": {
             "link_cache": len(engine._global_link_cache),
@@ -723,6 +742,11 @@ async def feeds_status_ws(websocket: WebSocket) -> None:
 
 @app.post("/api/v1/feeds/configure", dependencies=[Depends(require_roles("admin"))])
 async def configure_feeds(payload: FeedConfigRequest, user: UserContext = Depends(get_current_user)) -> dict:
+    if os.getenv("VERCEL"):
+        raise HTTPException(
+            status_code=501,
+            detail="Feed configuration writes to .env are disabled on Vercel. Configure environment variables in the Vercel dashboard.",
+        )
     env_path = BASE_DIR.parent / ".env"
     existing = env_path.read_text(encoding="utf-8").splitlines() if env_path.exists() else []
     key_map = {
@@ -781,7 +805,7 @@ async def analyze(
 
     result, ioc_intel = await asyncio.gather(
         engine.analyze_async(payload.text),
-        threat_intel_engine.scan_async(text=payload.text, live_feeds=LIVE_FEEDS_DEFAULT),
+        threat_intel_engine.scan_async(text=payload.text, live_feeds=_live_feeds_default()),
     )
     result["ioc_intelligence"] = ioc_intel
     _set_cached(ck, result)
@@ -814,7 +838,7 @@ async def threat_intel(
     background_tasks: BackgroundTasks,
     user: UserContext = Depends(get_current_user),
 ) -> dict:
-    live = LIVE_FEEDS_DEFAULT if payload.live_feeds is None else bool(payload.live_feeds)
+    live = _live_feeds_default() if payload.live_feeds is None else bool(payload.live_feeds)
     result = await threat_intel_engine.scan_async(
         text=payload.text, urls=payload.urls, domains=payload.domains,
         ips=payload.ips, hashes=payload.hashes, live_feeds=live,
@@ -877,7 +901,7 @@ async def analyze_file(
     score = min(100, max(0, score))
     level = "critical" if score >= 80 else ("high" if score >= 55 else ("medium" if score >= 30 else "low"))
 
-    file_ioc = await threat_intel_engine.scan_async(hashes=[sha256], live_feeds=LIVE_FEEDS_DEFAULT)
+    file_ioc = await threat_intel_engine.scan_async(hashes=[sha256], live_feeds=_live_feeds_default())
 
     background_tasks.add_task(
         case_store.audit, actor=user.username, role=user.role, action="malware_file_analysis",
@@ -939,7 +963,7 @@ async def fusion_scan(
             ),
         )
         if payload.text and payload.text.strip() and isinstance(result.get("text_analysis"), dict):
-            ioc = await threat_intel_engine.scan_async(text=payload.text, live_feeds=LIVE_FEEDS_DEFAULT)
+            ioc = await threat_intel_engine.scan_async(text=payload.text, live_feeds=_live_feeds_default())
             result["text_analysis"]["ioc_intelligence"] = ioc
         if payload.website_url and payload.website_url.strip():
             website_intel = await loop.run_in_executor(

@@ -41,11 +41,6 @@ class AuthManager:
                 if role not in allowed_roles:
                     continue
                 out[key] = {"role": role, "username": username}
-        if not out:
-            raise RuntimeError(
-                "No valid API keys configured. Set RISKINTEL_API_KEYS as "
-                "'key1:admin:alice,key2:analyst:bob,key3:viewer:eve'."
-            )
         return out
 
     @property
